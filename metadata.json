@@ -1,0 +1,5 @@
+{
+  "name": "小游戏大实验 Web版",
+  "description": "一个沉浸式化学元素收集网页游戏。支持鼠标与键盘操作，探索微观世界，合成化合物，击败BOSS。",
+  "requestFramePermissions": []
+}
