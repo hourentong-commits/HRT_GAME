@@ -1,4 +1,5 @@
 
+
 export interface Position {
   x: number;
   y: number;
@@ -34,6 +35,7 @@ export enum IconType {
   CYLINDER = 'CYLINDER',       // 量筒/集气瓶
   BURNER = 'BURNER',           // 酒精灯
   ALKALI_METAL = 'ALKALI_METAL',
+  ALKALINE_EARTH = 'ALKALINE_EARTH',
   TRANSITION_METAL = 'TRANSITION_METAL',
   NON_METAL = 'NON_METAL',
   NOBLE_GAS = 'NOBLE_GAS',
@@ -150,7 +152,8 @@ export interface UserProfile {
   nickname: string;
   themeId: string;
   bestScore: number;
-  hasCompletedTutorial: boolean; // New Flag
+  hasCompletedTutorial: boolean; 
+  unlockedAchievements: string[]; // IDs of unlocked achievements
 }
 
 export interface GameSettings {
@@ -169,6 +172,14 @@ export interface Rank {
   title: string;
   minScore: number;
   badgeColor: string;
+}
+
+export interface Achievement {
+  id: string;
+  title: string;
+  description: string;
+  icon: string;
+  conditionDescription?: string;
 }
 
 export enum TutorialStep {

@@ -1,7 +1,6 @@
-
 import { GoogleGenAI, Type } from "@google/genai";
 import { Chemical, HazardType, IconType } from '../types';
-import { FALLBACK_CHEMICALS } from '../constants';
+import { FALLBACK_CHEMICALS, REACTION_RECIPES } from '../constants';
 
 const getAiClient = () => {
   const apiKey = process.env.API_KEY;
@@ -27,6 +26,11 @@ export const generateGameData = async (level: number, playerStats: Record<string
     console.warn("No API Key found. Using offline mode.");
     return getFallbackData(level);
   }
+
+  // Extract useful ingredients from recipes to guide the AI
+  const usefulIngredients = Array.from(new Set(
+    REACTION_RECIPES.flatMap(r => r.inputs.map(i => i.formula))
+  )).join(', ');
 
   // --- Dynamic Difficulty Logic ---
   let scope = "";
@@ -76,15 +80,19 @@ export const generateGameData = async (level: number, playerStats: Record<string
     - 危险程度: ${hazardProfile}
     - 化合物要求: ${compoundFocus}
     - 动态调整: ${adaptiveInstruction}
-
+    
+    **关键要求**: 
+    为了确保游戏内的化学反应系统正常工作，请在生成的列表中**务必包含**以下部分化学式（如果符合当前难度）：
+    ${usefulIngredients}
+    
     数据规范:
     1. **id**: 唯一字符串 (e.g. "L${level}-Na")。
     2. **name**: 中文名称 (e.g. "硫酸")。
-    3. **formula**: 化学式 (e.g. "H₂SO₄")。
+    3. **formula**: 化学式 (e.g. "H2SO4", "Fe", "O")。注意：数字不要用下标，直接用普通数字。
     4. **color**: 代表颜色 (Hex String)。
     5. **description**: 有趣的简短科普描述 (小学生易懂)。
-    6. **trivia**: 一个非常有趣的冷知识 (不超过2句话，例如"它能让声音变尖！")。
-    7. **points**: 分数 (10-500)，越稀有/危险分数越高。
+    6. **trivia**: 一个非常有趣的冷知识 (不超过2句话)。
+    7. **points**: 分数 (10-500)。
     8. **hazard**: 必须是以下之一 [${Object.values(HazardType).join(', ')}]。
     9. **icon**: 必须是以下之一 [${Object.values(IconType).join(', ')}]。
        - 化合物必须设为 COMPOUND。
@@ -128,7 +136,6 @@ export const generateGameData = async (level: number, playerStats: Record<string
     
     return getFallbackData(level);
   } catch (error: any) {
-    // Specifically handle Permission (403) and Quota (429) errors gracefully
     if (error.status === 403 || error.code === 403 || 
         error.status === 429 || error.code === 429 ||
         (error.message && (error.message.includes('permission') || error.message.includes('quota') || error.message.includes('RESOURCE_EXHAUSTED')))) {

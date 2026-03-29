@@ -1,6 +1,7 @@
+
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Chemical, GameItem, GameStatus, Player, HazardType, IconType, ReactionRecipe, Position, Boss, BossState, Projectile, Theme, GameSettings, Rank, TutorialStep } from '../types';
-import { MAP_WIDTH, MAP_HEIGHT, PLAYER_RADIUS, ITEM_RADIUS, SNAKE_SPEED_BASE, SNAKE_SPEED_MIN, SNAKE_SPEED_MAX, SEGMENT_SPACING, GROWTH_PER_ITEM, INITIAL_LENGTH, REACTION_RECIPES, TURN_SMOOTHING, BOSS_HP_PER_LEVEL, LEVEL_SCORE_THRESHOLD_BASE, PLAYER_RANKS, BOSS_ENCIRCLE_DPS, SNAKE_EVOLUTION_THRESHOLD, SNAKE_RESET_LENGTH, EVOLUTION_SPEED_BONUS, MAX_BOSSES_PER_LEVEL, AMMO_PACK_TEMPLATE, MISSILE_AMMO_THRESHOLD, MISSILE_AMMO_COST, NORMAL_AMMO_DAMAGE, MISSILE_DAMAGE, MISSILE_SPEED, RAPID_FIRE_COOLDOWN, MISSILE_COOLDOWN, BOSS_TEMPLATES, NORMAL_AMMO_SPEED, NORMAL_AMMO_TURN_RATE, MISSILE_BASE_TURN_RATE, MISSILE_LEVEL_TURN_BONUS, FALLBACK_CHEMICALS } from '../constants';
+import { Chemical, GameItem, GameStatus, Player, HazardType, IconType, ReactionRecipe, Position, Boss, BossState, Projectile, Theme, GameSettings, Rank, TutorialStep, Achievement } from '../types';
+import { MAP_WIDTH, MAP_HEIGHT, PLAYER_RADIUS, ITEM_RADIUS, SNAKE_SPEED_BASE, SNAKE_SPEED_MIN, SNAKE_SPEED_MAX, SEGMENT_SPACING, GROWTH_PER_ITEM, INITIAL_LENGTH, REACTION_RECIPES, TURN_SMOOTHING, BOSS_HP_PER_LEVEL, LEVEL_SCORE_THRESHOLD_BASE, PLAYER_RANKS, BOSS_ENCIRCLE_DPS, SNAKE_EVOLUTION_THRESHOLD, SNAKE_RESET_LENGTH, EVOLUTION_SPEED_BONUS, MAX_BOSSES_PER_LEVEL, AMMO_PACK_TEMPLATE, MISSILE_AMMO_THRESHOLD, MISSILE_AMMO_COST, NORMAL_AMMO_DAMAGE, MISSILE_DAMAGE, MISSILE_SPEED, RAPID_FIRE_COOLDOWN, MISSILE_COOLDOWN, BOSS_TEMPLATES, NORMAL_AMMO_SPEED, NORMAL_AMMO_TURN_RATE, MISSILE_BASE_TURN_RATE, MISSILE_LEVEL_TURN_BONUS, FALLBACK_CHEMICALS, ACHIEVEMENTS } from '../constants';
 import Controls from './Controls';
 import { audioService } from '../services/audioService';
 import { generateGameData } from '../services/geminiService';
@@ -10,7 +11,9 @@ interface GameEngineProps {
   onGameOver: (score: number) => void;
   onBossDefeated: () => void;
   onTutorialComplete: () => void;
+  onUnlockAchievement: (achievement: Achievement) => void;
   hasCompletedTutorial: boolean;
+  unlockedAchievements: string[];
   status: GameStatus;
   reviveTrigger: number;
   revivesLeft: number;
@@ -18,7 +21,9 @@ interface GameEngineProps {
   settings: GameSettings;
   nickname: string;
   isPaused: boolean;     
-  onPause: () => void;   
+  onPause: () => void;
+  isMuted: boolean;
+  onToggleMute: () => void;
 }
 
 interface Particle {
@@ -42,6 +47,7 @@ interface FloatingText {
   size?: number;
 }
 
+// Simplified Equation Overlay for Center Screen (only for major events now)
 interface EquationOverlay {
     text: string;
     subText: string;
@@ -57,9 +63,17 @@ interface TriviaOverlay {
     expiresAt: number;
 }
 
+// New Interface for Reaction Hints
+interface ReactionHint {
+    recipe: ReactionRecipe;
+    haveIngredients: string[];
+    missingIngredients: string[];
+    isReady: boolean;
+}
+
 const GameEngine: React.FC<GameEngineProps> = ({ 
-    initialChemicals, onGameOver, onBossDefeated, onTutorialComplete, hasCompletedTutorial,
-    status, reviveTrigger, revivesLeft, theme, settings, nickname, isPaused, onPause 
+    initialChemicals, onGameOver, onBossDefeated, onTutorialComplete, onUnlockAchievement, hasCompletedTutorial, unlockedAchievements,
+    status, reviveTrigger, revivesLeft, theme, settings, nickname, isPaused, onPause, isMuted, onToggleMute 
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -96,12 +110,18 @@ const GameEngine: React.FC<GameEngineProps> = ({
   const lastTimeRef = useRef<number>(0);
   const speedScaleRef = useRef(0.1); 
   const shootCooldownRef = useRef(0);
-  const isShootingRef = useRef(false);
   const startPosRef = useRef({x: 0, y: 0});
   const lastHeartbeatTimeRef = useRef(0);
   
   const currentRankRef = useRef<Rank>(PLAYER_RANKS[0]);
   const prevRevivesRef = useRef(revivesLeft);
+
+  // Session Stats for Achievements
+  const sessionStatsRef = useRef({
+      bossKills: 0,
+      collectedAlkali: new Set<string>(),
+      reactionCount: 0,
+  });
 
   // --- STATE ---
   const [uiScore, setUiScore] = useState(0);
@@ -109,6 +129,7 @@ const GameEngine: React.FC<GameEngineProps> = ({
   const [uiInventory, setUiInventory] = useState<Record<string, number>>({});
   const [recentItems, setRecentItems] = useState<string[]>([]); // New state for recent items
   const [uiAmmo, setUiAmmo] = useState(0);
+  const [uiReactionCount, setUiReactionCount] = useState(0); // New State
   const [floatingTexts, setFloatingTexts] = useState<FloatingText[]>([]);
   const [bossHp, setBossHp] = useState({ current: 0, max: 0 });
   const [levelUpMessage, setLevelUpMessage] = useState<string | null>(null);
@@ -117,6 +138,7 @@ const GameEngine: React.FC<GameEngineProps> = ({
   const [showMaxRankCert, setShowMaxRankCert] = useState(false);
   const [equationOverlay, setEquationOverlay] = useState<EquationOverlay | null>(null);
   const [triviaOverlay, setTriviaOverlay] = useState<TriviaOverlay | null>(null);
+  const [reactionHints, setReactionHints] = useState<ReactionHint[]>([]);
   
   const [tutorialStep, setTutorialStep] = useState<TutorialStep>(TutorialStep.NONE);
 
@@ -136,11 +158,68 @@ const GameEngine: React.FC<GameEngineProps> = ({
       prevRevivesRef.current = revivesLeft;
   }, [revivesLeft]);
 
+  // Update Reaction Hints based on Inventory
+  useEffect(() => {
+      if (!settings.showReactions) {
+          setReactionHints([]);
+          return;
+      }
+
+      const inv = uiInventory;
+      const hints: ReactionHint[] = [];
+
+      REACTION_RECIPES.forEach(recipe => {
+          const have: string[] = [];
+          const missing: string[] = [];
+          let isReady = true;
+
+          recipe.inputs.forEach(input => {
+              if ((inv[input.formula] || 0) >= input.count) {
+                  have.push(input.formula);
+              } else if ((inv[input.formula] || 0) > 0) {
+                  // Have some but not enough count
+                  have.push(`${input.formula}`);
+                  missing.push(`${input.formula}`);
+                  isReady = false;
+              } else {
+                  missing.push(input.formula);
+                  isReady = false;
+              }
+          });
+
+          // Only show hints if we have at least one ingredient OR if it was just ready (handled by logic loop usually)
+          // To make it cleaner: Show if we have ANY part of it.
+          // Filter: Must have at least one ingredient type present in inventory
+          const hasPartial = recipe.inputs.some(input => (inv[input.formula] || 0) > 0);
+          
+          if (hasPartial) {
+              hints.push({
+                  recipe,
+                  haveIngredients: have,
+                  missingIngredients: missing,
+                  isReady
+              });
+          }
+      });
+
+      // Sort: Ready first, then by completeness
+      hints.sort((a, b) => {
+          if (a.isReady && !b.isReady) return -1;
+          if (!a.isReady && b.isReady) return 1;
+          return a.missingIngredients.length - b.missingIngredients.length;
+      });
+
+      setReactionHints(hints.slice(0, 3)); // Max 3 hints to avoid clutter
+  }, [uiInventory, settings.showReactions]);
+
   // --- CONTROLS HOOKS ---
   const handleShootingInput = () => {
     if (isPaused) return;
-    isShootingRef.current = true;
-    audioService.playButtonTap();
+    // Direct fire if cooldown is ready, no more holding state
+    if (shootCooldownRef.current <= 0 && playerRef.current.ammo > 0) {
+        audioService.playButtonTap();
+        fireProjectile();
+    }
   };
 
   // --- PC MOUSE CONTROLS ---
@@ -161,19 +240,11 @@ const GameEngine: React.FC<GameEngineProps> = ({
         }
     };
     
-    const handleMouseUp = (e: MouseEvent) => {
-        if (e.button === 0) {
-            isShootingRef.current = false;
-        }
-    };
-
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mousedown', handleMouseDown);
-    window.addEventListener('mouseup', handleMouseUp);
     return () => {
         window.removeEventListener('mousemove', handleMouseMove);
         window.removeEventListener('mousedown', handleMouseDown);
-        window.removeEventListener('mouseup', handleMouseUp);
     };
   }, [isPaused]);
 
@@ -190,7 +261,6 @@ const GameEngine: React.FC<GameEngineProps> = ({
             case 'Space': 
             case 'KeyJ':
                 if (!e.repeat) handleShootingInput();
-                isShootingRef.current = true; 
                 break;
             case 'ShiftLeft':
             case 'ShiftRight':
@@ -208,10 +278,6 @@ const GameEngine: React.FC<GameEngineProps> = ({
     const handleKeyUp = (e: KeyboardEvent) => {
         const p = playerRef.current;
         switch(e.code) {
-            case 'Space': 
-            case 'KeyJ':
-                isShootingRef.current = false; 
-                break;
             case 'ShiftLeft':
             case 'ShiftRight':
             case 'KeyW': 
@@ -277,9 +343,17 @@ const GameEngine: React.FC<GameEngineProps> = ({
     levelRef.current = 1;
     bossesSpawnedInLevelRef.current = 0;
     
+    // Reset Session Stats
+    sessionStatsRef.current = {
+        bossKills: 0,
+        collectedAlkali: new Set(),
+        reactionCount: 0,
+    };
+
     setUiScore(0);
     setUiLevel(1);
     setUiAmmo(5);
+    setUiReactionCount(0);
     setCurrentRank(PLAYER_RANKS[0]);
     currentRankRef.current = PLAYER_RANKS[0];
     setShowMaxRankCert(false);
@@ -431,10 +505,6 @@ const GameEngine: React.FC<GameEngineProps> = ({
 
       if (shootCooldownRef.current > 0) shootCooldownRef.current--;
 
-      if (isShootingRef.current && shootCooldownRef.current <= 0 && player.ammo > 0) {
-          fireProjectile();
-      }
-
       // Check low health for heartbeat sound
       if (player.health < 30 && player.health > 0) {
           const now = Date.now();
@@ -475,9 +545,14 @@ const GameEngine: React.FC<GameEngineProps> = ({
       }
       player.head = newHead;
 
+      // Dynamic collection radius based on snake size (evolution tier)
+      // Visual radius is approx 15 + tier * 2. 
+      const currentHeadRadius = 15 + player.evolutionTier * 2;
+
       itemsRef.current = itemsRef.current.filter(item => {
+          // Use dynamic radius for collision detection
           const dist = Math.hypot(newHead.x - item.position.x, newHead.y - item.position.y);
-          if (dist < PLAYER_RADIUS + item.radius) {
+          if (dist < currentHeadRadius + item.radius) {
               handleCollect(item);
               return false;
           }
@@ -584,6 +659,14 @@ const GameEngine: React.FC<GameEngineProps> = ({
       }
   };
 
+  const checkAchievement = (id: string) => {
+      if (unlockedAchievements.includes(id)) return;
+      const achievement = ACHIEVEMENTS.find(a => a.id === id);
+      if (achievement) {
+          onUnlockAchievement(achievement);
+      }
+  };
+
   const handleCollect = (item: GameItem) => {
       const player = playerRef.current;
       
@@ -594,6 +677,15 @@ const GameEngine: React.FC<GameEngineProps> = ({
           audioService.playCollect();
           spawnParticles(item.position.x, item.position.y, item.color, 12, 'sparkle');
           return;
+      }
+
+      // Achievement Check: Alkali Collection
+      if (item.icon === IconType.ALKALI_METAL) {
+          sessionStatsRef.current.collectedAlkali.add(item.formula);
+          const collected = sessionStatsRef.current.collectedAlkali;
+          if (collected.has('Li') && collected.has('Na') && collected.has('K')) {
+              checkAchievement('alkali_collection');
+          }
       }
 
       player.length += GROWTH_PER_ITEM;
@@ -640,36 +732,60 @@ const GameEngine: React.FC<GameEngineProps> = ({
       checkReactions();
   };
 
+  // Implement cascade/chain reactions logic
   const checkReactions = () => {
-      for (const recipe of REACTION_RECIPES) {
-          let canMake = true;
-          for (const input of recipe.inputs) {
-              if ((inventoryRef.current.get(input.formula) || 0) < input.count) {
-                  canMake = false;
-                  break;
+      let reactionOccurred = true;
+      let iterations = 0;
+      const MAX_ITERATIONS = 5; // Prevent infinite loops
+      
+      // Helper to update state at end of chain
+      let inventoryUpdated = false;
+
+      while (reactionOccurred && iterations < MAX_ITERATIONS) {
+          reactionOccurred = false;
+          iterations++;
+
+          for (const recipe of REACTION_RECIPES) {
+              let canMake = true;
+              for (const input of recipe.inputs) {
+                  if ((inventoryRef.current.get(input.formula) || 0) < input.count) {
+                      canMake = false;
+                      break;
+                  }
+              }
+
+              if (canMake) {
+                  recipe.inputs.forEach(input => {
+                      const current = inventoryRef.current.get(input.formula) || 0;
+                      const nextVal = current - input.count;
+                      inventoryRef.current.set(input.formula, nextVal);
+                  });
+
+                  // Add product to inventory
+                  inventoryRef.current.set(recipe.product, (inventoryRef.current.get(recipe.product) || 0) + 1);
+                  
+                  // Update recent items to show created compound
+                  setRecentItems(prev => {
+                      // Filter out product if it was there, add to top
+                      const filtered = prev.filter(f => f !== recipe.product);
+                      return [recipe.product, ...filtered].slice(0, 9);
+                  });
+
+                  triggerReactionEffect(recipe);
+                  
+                  reactionOccurred = true; 
+                  inventoryUpdated = true;
               }
           }
+      }
 
-          if (canMake) {
-              recipe.inputs.forEach(input => {
-                  const current = inventoryRef.current.get(input.formula) || 0;
-                  inventoryRef.current.set(input.formula, current - input.count);
-              });
-
-              inventoryRef.current.set(recipe.product, (inventoryRef.current.get(recipe.product) || 0) + 1);
-              
-              const invObj: Record<string, number> = {};
-              inventoryRef.current.forEach((v, k) => invObj[k] = v);
-              setUiInventory(invObj);
-
-              // Update recent items to show created compound
-              setRecentItems(prev => {
-                  const filtered = prev.filter(f => f !== recipe.product);
-                  return [recipe.product, ...filtered].slice(0, 9);
-              });
-
-              triggerReactionEffect(recipe);
-          }
+      // Final UI sync after chain reaction completes
+      if (inventoryUpdated) {
+          const invObj: Record<string, number> = {};
+          inventoryRef.current.forEach((v, k) => {
+              if (v > 0) invObj[k] = v; // Only keep positive counts for UI state if we want strictness, or keep all
+          });
+          setUiInventory(invObj);
       }
   };
 
@@ -680,6 +796,15 @@ const GameEngine: React.FC<GameEngineProps> = ({
       
       player.ammo += recipe.ammoYield;
       setUiAmmo(player.ammo);
+
+      // Track Reaction Count
+      sessionStatsRef.current.reactionCount++;
+      setUiReactionCount(sessionStatsRef.current.reactionCount);
+
+      // Achievement Check: Aqua Regia
+      if (recipe.productName === '王水') {
+          checkAchievement('aqua_regia');
+      }
 
       if (recipe.buff) {
           if (recipe.buff.type === 'SPEED') {
@@ -694,7 +819,8 @@ const GameEngine: React.FC<GameEngineProps> = ({
           }
       }
 
-      if (settings.showReactions) {
+      // Trigger overlay only for complex reactions to avoid spam
+      if (settings.showReactions && recipe.power > 150) {
           setEquationOverlay({ 
               text: recipe.equation, 
               subText: recipe.reactionType, 
@@ -905,6 +1031,14 @@ const GameEngine: React.FC<GameEngineProps> = ({
           scoreRef.current += 5000;
           spawnParticles(bossRef.current.x, bossRef.current.y, '#ffd700', 80, 'sparkle');
           bossRef.current = null;
+
+          // Achievement Check: Kills
+          sessionStatsRef.current.bossKills++;
+          if (sessionStatsRef.current.bossKills === 1) {
+              checkAchievement('first_blood');
+          } else if (sessionStatsRef.current.bossKills === 10) {
+              checkAchievement('boss_hunter');
+          }
       }
   };
 
@@ -922,12 +1056,18 @@ const GameEngine: React.FC<GameEngineProps> = ({
 
   const handleLevelUp = async (isBossDefeat = false) => {
       levelRef.current++;
+      
+      // Achievement Check: Level
+      if (levelRef.current === 8) { // Updated to Level 8
+          checkAchievement('high_level');
+      }
+
       bossesSpawnedInLevelRef.current = 0; 
       nextLevelScoreRef.current += (LEVEL_SCORE_THRESHOLD_BASE + levelRef.current * 800);
       setUiLevel(levelRef.current);
       
       setLevelUpMessage(`LEVEL ${levelRef.current}`);
-      setTimeout(() => setLevelUpMessage(null), 2000);
+      setTimeout(() => setLevelUpMessage(null), 2500);
       audioService.playRankUp();
 
       generateGameData(levelRef.current).then(newData => {
@@ -972,7 +1112,7 @@ const GameEngine: React.FC<GameEngineProps> = ({
       const glassStroke = '#ffffffaa';
       
       let renderType = item.icon;
-      if (item.icon === IconType.ALKALI_METAL || item.icon === IconType.TRANSITION_METAL || item.icon === IconType.RARE_EARTH) {
+      if (item.icon === IconType.ALKALI_METAL || item.icon === IconType.ALKALINE_EARTH || item.icon === IconType.TRANSITION_METAL || item.icon === IconType.RARE_EARTH) {
           renderType = IconType.BEAKER;
       } else if (item.icon === IconType.NOBLE_GAS || item.icon === IconType.HALOGEN || item.icon === IconType.NON_METAL || item.icon === IconType.CYLINDER) {
           renderType = IconType.CYLINDER;
@@ -1158,7 +1298,8 @@ const GameEngine: React.FC<GameEngineProps> = ({
       
       ctx.fillStyle = theme.primaryColor;
       ctx.beginPath();
-      ctx.arc(0, 0, 15 + player.evolutionTier*2, 0, Math.PI*2);
+      const visualHeadRadius = 15 + player.evolutionTier*2;
+      ctx.arc(0, 0, visualHeadRadius, 0, Math.PI*2);
       ctx.fill();
       
       // --- DYNAMIC EYES ---
@@ -1209,51 +1350,133 @@ const GameEngine: React.FC<GameEngineProps> = ({
       // Items
       itemsRef.current.forEach(item => drawIcon(ctx, item));
 
-      // Boss
+      // --- BOSS RENDERING (NEW) ---
       if (bossRef.current) {
           const boss = bossRef.current;
           ctx.save();
           ctx.translate(boss.x, boss.y);
           
-          // Health Bar Ring (Keep thin ring for status, but remove body fill)
-          const hpPct = boss.hp / boss.maxHp;
-          ctx.beginPath();
-          ctx.arc(0, 0, boss.radius + 10, -Math.PI/2, -Math.PI/2 + (Math.PI*2 * hpPct));
-          ctx.strokeStyle = hpPct < 0.3 ? '#ef4444' : boss.color;
-          ctx.lineWidth = 8;
-          ctx.stroke();
-
-          // NO BODY FILL (As requested)
-          // ctx.fillStyle = boss.color;
-          // ctx.beginPath();
-          // ctx.arc(0, 0, boss.radius, 0, Math.PI*2);
-          // ctx.fill();
+          const t = time * 0.002;
+          const isHurt = boss.state === BossState.HURT;
           
-          // Animal Icon / Face (Increased Size)
-          ctx.font = '160px Arial'; // Doubled size
-          ctx.shadowColor = boss.color;
-          ctx.shadowBlur = 20;
+          // 0. Hurt Glitch Effect (Shake)
+          if (isHurt) {
+             const shake = 5;
+             ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+          }
+
+          // 1. Rotating Shield Arcs
+          const shieldRadius = boss.radius + 15;
+          ctx.lineWidth = 4;
+          // Outer Ring
+          ctx.beginPath();
+          ctx.strokeStyle = isHurt ? '#fff' : boss.color;
+          ctx.globalAlpha = 0.6;
+          ctx.arc(0, 0, shieldRadius, t, t + Math.PI * 1.5);
+          ctx.stroke();
+          // Inner Ring (Counter-rotate)
+          ctx.beginPath();
+          ctx.strokeStyle = boss.color;
+          ctx.globalAlpha = 0.4;
+          ctx.arc(0, 0, shieldRadius - 10, -t * 1.5, -t * 1.5 + Math.PI);
+          ctx.stroke();
+          ctx.globalAlpha = 1.0;
+
+          // 2. Core Body
+          ctx.fillStyle = '#0f172a'; // Dark core
+          ctx.beginPath();
+          ctx.arc(0, 0, boss.radius, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Core Gradient Aura
+          const gradient = ctx.createRadialGradient(0, 0, 10, 0, 0, boss.radius);
+          gradient.addColorStop(0, '#fff');
+          gradient.addColorStop(0.3, boss.color);
+          gradient.addColorStop(1, 'transparent');
+          ctx.fillStyle = gradient;
+          ctx.globalAlpha = 0.3 + Math.sin(t * 5) * 0.1; // Pulsing
+          ctx.beginPath();
+          ctx.arc(0, 0, boss.radius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 1.0;
+
+          // 3. Orbiting Satellites (Electrons)
+          const satelliteCount = 3;
+          for(let i=0; i<satelliteCount; i++) {
+              const angle = t * 2 + (i * (Math.PI * 2 / satelliteCount));
+              const satX = Math.cos(angle) * (boss.radius + 5);
+              const satY = Math.sin(angle) * (boss.radius + 5);
+              ctx.fillStyle = '#fff';
+              ctx.beginPath();
+              ctx.arc(satX, satY, 4, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.shadowColor = boss.color;
+              ctx.shadowBlur = 10;
+              ctx.stroke();
+              ctx.shadowBlur = 0;
+          }
+
+          // 4. Face/Icon
+          ctx.font = '80px Arial';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
-          ctx.fillText(boss.animalIcon, 0, 10); // Offset slightly for center visual
+          ctx.fillStyle = '#fff';
+          if (isHurt && Math.random() > 0.5) {
+               ctx.globalAlpha = 0.5;
+               ctx.fillText('⚡', 0, 0); // Glitch icon
+          } else {
+               ctx.fillText(boss.animalIcon, 0, 5);
+          }
+          ctx.globalAlpha = 1.0;
+
+          // 5. Tech Health Ring (Segments)
+          const segments = 20;
+          const hpPct = boss.hp / boss.maxHp;
+          const activeSegments = Math.ceil(segments * hpPct);
+          const ringRadius = boss.radius + 25;
+          
+          ctx.lineWidth = 6;
+          for(let i=0; i<segments; i++) {
+              const startAngle = (i / segments) * Math.PI * 2 - Math.PI/2;
+              const endAngle = ((i + 0.8) / segments) * Math.PI * 2 - Math.PI/2;
+              
+              ctx.beginPath();
+              ctx.arc(0, 0, ringRadius, startAngle, endAngle);
+              // Color based on HP level (Green -> Yellow -> Red)
+              if (i < activeSegments) {
+                  if (hpPct > 0.6) ctx.strokeStyle = '#22c55e'; // Green
+                  else if (hpPct > 0.3) ctx.strokeStyle = '#eab308'; // Yellow
+                  else ctx.strokeStyle = '#ef4444'; // Red
+                  
+                  ctx.shadowColor = ctx.strokeStyle;
+                  ctx.shadowBlur = 5;
+              } else {
+                  ctx.strokeStyle = '#334155'; // Inactive grey
+                  ctx.shadowBlur = 0;
+              }
+              ctx.stroke();
+          }
           ctx.shadowBlur = 0;
 
-          // Name
+          // Name Label
           ctx.fillStyle = '#fff';
-          ctx.font = 'bold 24px Arial';
+          ctx.font = 'bold 16px monospace';
           ctx.shadowColor = 'black';
           ctx.shadowBlur = 4;
-          ctx.fillText(boss.name, 0, -boss.radius - 30);
+          ctx.fillText(boss.name.toUpperCase(), 0, -boss.radius - 40);
           ctx.shadowBlur = 0;
-          
+
+          // Trapped Effect
           if (boss.state === BossState.TRAPPED) {
               ctx.strokeStyle = '#00ffff';
-              ctx.lineWidth = 4;
-              ctx.setLineDash([10, 10]);
+              ctx.lineWidth = 2;
               ctx.beginPath();
-              ctx.arc(0, 0, boss.radius + 20, 0, Math.PI*2);
+              for(let i=0; i<8; i++) {
+                 const angle = (i/8) * Math.PI * 2 + t;
+                 ctx.moveTo(Math.cos(angle)*boss.radius, Math.sin(angle)*boss.radius);
+                 ctx.lineTo(Math.cos(angle)*(boss.radius+40), Math.sin(angle)*(boss.radius+40));
+              }
               ctx.stroke();
-              ctx.setLineDash([]);
           }
 
           ctx.restore();
@@ -1318,7 +1541,7 @@ const GameEngine: React.FC<GameEngineProps> = ({
       <div className={`absolute inset-0 pointer-events-none flex flex-col justify-between transition-opacity duration-300 ${settings.showUI ? 'opacity-100' : 'opacity-0'}`}>
           
           {/* Top Section Container (Split Layout) */}
-          <div className="relative w-full p-4 flex justify-between items-start z-10">
+          <div className="relative w-full p-3 flex justify-between items-start z-10">
               
               {/* Left Column: Stats & Pause */}
               <div className="flex flex-col gap-2 items-start w-1/3">
@@ -1334,107 +1557,193 @@ const GameEngine: React.FC<GameEngineProps> = ({
                           ⏸
                       </button>
 
+                      {/* Mute Button - Moved Here */}
+                      <button 
+                        onClick={() => {
+                            audioService.playButtonTap();
+                            onToggleMute();
+                        }}
+                        className="bg-slate-900/80 backdrop-blur w-10 h-10 rounded-xl border border-white/20 text-white flex items-center justify-center hover:bg-slate-800 active:scale-95 transition-all shadow-lg"
+                      >
+                          {isMuted ? '🔇' : '🔊'}
+                      </button>
+
                       {/* Score Badge */}
-                      <div className="bg-slate-900/80 backdrop-blur px-4 py-2 rounded-xl border border-white/10 text-white font-mono shadow-lg">
+                      <div className="bg-slate-900/80 backdrop-blur px-4 py-2 rounded-xl border border-white/10 text-white font-mono shadow-lg hidden md:block">
                           <div className="text-[10px] text-slate-400 leading-none mb-1">SCORE</div>
                           <div className="text-xl font-bold text-cyan-400 leading-none">{Math.floor(uiScore).toLocaleString()}</div>
                       </div>
                   </div>
                   
-                  {/* Revives Indicator */}
-                  <div className="bg-slate-900/80 backdrop-blur px-3 py-1.5 rounded-xl border border-white/10 flex items-center gap-2 shadow-lg">
-                      <span className="text-red-500 text-lg">❤️</span>
-                      <span className="text-lg font-bold text-white">x {revivesLeft}</span>
+                  {/* Mobile Score Compact */}
+                  <div className="md:hidden bg-slate-900/80 backdrop-blur px-3 py-1 rounded-xl border border-white/10 text-white font-mono shadow-lg text-sm font-bold text-cyan-400">
+                      {Math.floor(uiScore).toLocaleString()}
                   </div>
 
-                  {/* Nickname Display */}
+                  {/* Nickname Display - Moved to Left */}
                   <div className="bg-slate-900/50 backdrop-blur px-3 py-1 rounded-lg border border-white/5 text-slate-300 text-xs font-bold">
                      👤 {nickname}
                   </div>
               </div>
 
-              {/* Right Column: Level & Inventory */}
-              <div className="flex flex-col gap-2 items-end w-1/3 pointer-events-auto">
+              {/* Right Column: Level, Revives, Reactions & Inventory */}
+              <div className="flex flex-col gap-2 items-end w-1/3 pointer-events-auto relative">
                   
-                  {/* Level Badge */}
-                  <div className="bg-slate-900/80 backdrop-blur px-4 py-2 rounded-xl border border-white/10 text-right shadow-lg">
-                      <div className="text-[10px] text-slate-400 leading-none mb-1">LEVEL</div>
-                      <div className="text-xl font-bold text-yellow-400 leading-none">{uiLevel}</div>
+                  {/* HORIZONTAL DASHBOARD (Compact & Sleek) */}
+                  <div className="flex items-center gap-1.5 bg-slate-900/80 backdrop-blur-md rounded-full p-1 border border-white/10 shadow-2xl">
+                      
+                      {/* Level Chip */}
+                      <div className="flex items-center gap-1.5 pl-1 pr-3 py-0.5 bg-gradient-to-r from-yellow-500/20 to-transparent rounded-full border border-yellow-500/30">
+                          <div className="w-5 h-5 rounded-full bg-yellow-500 flex items-center justify-center text-[8px] font-black text-black shadow-inner">LV</div>
+                          <span className="text-xs font-black text-yellow-400 font-mono">{uiLevel}</span>
+                      </div>
+
+                      <div className="w-[1px] h-4 bg-white/10"></div>
+
+                      {/* Lives Chip */}
+                      <div className="flex items-center gap-1.5 pl-1 pr-3 py-0.5 bg-gradient-to-r from-red-500/20 to-transparent rounded-full border border-red-500/30">
+                          <div className={`w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[9px] shadow-inner ${revivesLeft <= 1 ? 'animate-ping' : ''}`}>❤️</div>
+                          <span className="text-xs font-black text-white font-mono">{revivesLeft}</span>
+                      </div>
+
+                      <div className="w-[1px] h-4 bg-white/10"></div>
+
+                      {/* Reactions Chip */}
+                      <div className="flex items-center gap-1.5 pl-1 pr-3 py-0.5 bg-gradient-to-r from-purple-500/20 to-transparent rounded-full border border-purple-500/30">
+                          <div className="w-5 h-5 rounded-full bg-purple-500 flex items-center justify-center text-[9px] shadow-inner animate-[spin_10s_linear_infinite]">⚗️</div>
+                          <span className="text-xs font-black text-white font-mono">{uiReactionCount}</span>
+                      </div>
                   </div>
                   
-                  {/* Inventory Panel - Tech Style */}
-                  <div className="bg-slate-900/90 backdrop-blur-md p-3 rounded-xl border border-cyan-500/30 shadow-lg flex flex-col gap-2 relative overflow-hidden group">
-                      <div className="absolute top-0 right-0 w-8 h-8 bg-cyan-500/10 rounded-bl-full"></div>
+                  {/* Inventory Panel - Tech Style (Compact) */}
+                  <div className="bg-slate-900/90 backdrop-blur-md p-2 rounded-xl border border-cyan-500/30 shadow-lg flex flex-col gap-1 relative overflow-hidden group">
+                      <div className="absolute top-0 right-0 w-6 h-6 bg-cyan-500/10 rounded-bl-full"></div>
                       
-                      <div className="text-[10px] font-bold text-cyan-400 uppercase tracking-widest border-b border-white/10 pb-1 mb-1 flex justify-between items-center">
+                      <div className="text-[9px] font-bold text-cyan-400 uppercase tracking-widest border-b border-white/10 pb-1 mb-1 flex justify-between items-center px-1">
                           <span>物质分析</span>
                           <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse"></span>
                       </div>
                       
-                      {/* Grid Items */}
-                      <div className="grid grid-cols-3 gap-1.5 w-32">
-                          {recentItems.map((key) => (
-                              <div key={key} className="bg-white/5 rounded aspect-square flex flex-col items-center justify-center relative border border-white/10 hover:border-cyan-500/50 transition-colors">
-                                  <span className="text-[10px] font-bold text-cyan-200">{key}</span>
-                                  <div className="absolute -bottom-1 -right-1 bg-slate-800 text-[8px] px-1 rounded text-white font-mono scale-90 border border-white/10">
+                      {/* Grid Items - Filtered to remove 0 counts */}
+                      <div className="grid grid-cols-3 gap-1 w-24">
+                          {recentItems.filter(key => (inventoryRef.current.get(key) || 0) > 0).map((key) => (
+                              <div key={key} className="bg-white/5 rounded aspect-square flex flex-col items-center justify-center relative border border-white/10 hover:border-cyan-500/50 transition-colors animate-in zoom-in duration-300">
+                                  {/* Dynamic font size for long formula names */}
+                                  <span className={`${key.length > 3 ? 'text-[7px]' : 'text-[9px]'} font-bold text-cyan-200 leading-none`}>{key}</span>
+                                  <div className="absolute -bottom-1 -right-1 bg-slate-800 text-[7px] px-1 rounded text-white font-mono scale-90 border border-white/10">
                                       {inventoryRef.current.get(key) || 0}
                                   </div>
                               </div>
                           ))}
                           {/* Fill empty slots */}
-                          {[...Array(Math.max(0, 9 - recentItems.length))].map((_, i) => (
+                          {[...Array(Math.max(0, 9 - recentItems.filter(key => (inventoryRef.current.get(key) || 0) > 0).length))].map((_, i) => (
                               <div key={`empty-${i}`} className="bg-black/20 rounded aspect-square border border-dashed border-white/5"></div>
                           ))}
                       </div>
                   </div>
+
+                   {/* SYNTHESIS RADAR (Dynamic Reaction Preview) */}
+                   {reactionHints.length > 0 && (
+                      <div className="mt-2 w-full max-w-[12rem] flex flex-col items-end gap-1 animate-in slide-in-from-right fade-in duration-300">
+                          {reactionHints.map((hint, idx) => (
+                              <div 
+                                  key={idx} 
+                                  className={`backdrop-blur-md border px-3 py-2 rounded-lg text-[10px] shadow-xl flex flex-col items-end gap-1 transition-all relative overflow-hidden
+                                    ${hint.isReady 
+                                      ? 'bg-gradient-to-r from-yellow-900/40 to-yellow-600/40 border-yellow-400/50 text-yellow-100 scale-105 origin-right animate-pulse' 
+                                      : 'bg-slate-900/80 border-cyan-800/30 text-slate-400 opacity-90'
+                                    }`}
+                              >
+                                  {hint.isReady && <div className="absolute inset-0 bg-yellow-400/5 animate-pulse"></div>}
+                                  
+                                  <div className="flex items-center gap-1 font-mono leading-none relative z-10">
+                                      {hint.isReady ? (
+                                          <span className="text-yellow-300 font-black tracking-widest uppercase text-[9px] flex items-center gap-1">
+                                              <span className="w-1.5 h-1.5 bg-yellow-400 rounded-full animate-ping"></span>
+                                              反应就绪 READY
+                                          </span>
+                                      ) : (
+                                          <span className="text-cyan-500/70 text-[8px] uppercase tracking-wider font-bold">Potential Reaction</span>
+                                      )}
+                                  </div>
+                                  
+                                  {/* Formula Preview */}
+                                  <div className="flex items-center gap-1.5 text-right leading-tight relative z-10">
+                                      <div className="flex items-center gap-0.5">
+                                        {hint.haveIngredients.map((ing, i) => (
+                                            <span key={`h-${i}`} className={`font-mono ${hint.isReady ? 'text-white font-bold' : 'text-cyan-300'}`}>{ing}</span>
+                                        ))}
+                                      </div>
+                                      <span className="text-slate-500 font-light">+</span>
+                                      <div className="flex items-center gap-0.5">
+                                        {hint.missingIngredients.map((ing, i) => (
+                                            <span key={`m-${i}`} className="text-red-400 opacity-60 font-mono italic">{ing}</span>
+                                        ))}
+                                      </div>
+                                      <span className="text-slate-400">→</span>
+                                      <span className={`font-bold font-mono ${hint.isReady ? 'text-yellow-300 text-xs' : 'text-slate-300'}`}>{hint.recipe.product}</span>
+                                  </div>
+                              </div>
+                          ))}
+                      </div>
+                   )}
+
               </div>
           </div>
 
-          {/* Center Top: Equation Overlay (Absolute Positioned for Independence) */}
+          {/* Equation Overlay (Center-Top, only for MAJOR reactions) */}
           {settings.showReactions && equationOverlay && Date.now() < equationOverlay.expiresAt && (
-             <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 animate-in slide-in-from-top fade-in duration-300 pointer-events-none w-full max-w-md px-4">
-                  <div className="bg-black/60 backdrop-blur-md border border-cyan-500/30 px-6 py-4 rounded-2xl shadow-[0_0_30px_rgba(6,182,212,0.2)] flex flex-col items-center gap-1 text-center">
+             <div className="absolute top-[22%] left-1/2 -translate-x-1/2 z-20 animate-in slide-in-from-top fade-in duration-300 pointer-events-none w-full max-w-sm px-4">
+                  <div className="bg-black/60 backdrop-blur-md border border-cyan-500/30 px-5 py-3 rounded-2xl shadow-[0_0_30px_rgba(6,182,212,0.2)] flex flex-col items-center gap-1 text-center transform hover:scale-105 transition-transform">
                       <div className="flex items-center gap-2 mb-1">
                           <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full"></span>
-                          <div className="text-[10px] font-bold text-cyan-300 uppercase tracking-widest">{equationOverlay.subText}</div>
+                          <div className="text-[9px] font-bold text-cyan-300 uppercase tracking-widest">{equationOverlay.subText}</div>
                           <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full"></span>
                       </div>
-                      <div className="text-xl md:text-2xl font-black text-white font-mono tracking-wide" dangerouslySetInnerHTML={{__html: equationOverlay.text}}></div>
-                      <div className="text-xs text-slate-300 mt-1 italic opacity-80">{equationOverlay.phenomenon}</div>
+                      <div className="text-lg font-black text-white font-mono tracking-wide" dangerouslySetInnerHTML={{__html: equationOverlay.text}}></div>
+                      <div className="text-[10px] text-slate-300 mt-0.5 italic opacity-80">{equationOverlay.phenomenon}</div>
                   </div>
              </div>
           )}
 
-          {/* Left Side: Trivia Popup (Absolute, Below Left Stats) */}
+          {/* Trivia Popup (Left Side, Below HUD info) - Moved Up to top-36 to avoid joystick */}
           {settings.showTrivia && triviaOverlay && Date.now() < triviaOverlay.expiresAt && (
-             <div className="absolute top-48 left-4 w-64 z-10 animate-in slide-in-from-left fade-in duration-500 pointer-events-none">
-                 <div className="bg-slate-900/95 backdrop-blur-xl border-l-4 rounded-r-xl shadow-2xl p-4 relative overflow-hidden flex flex-col gap-2" style={{borderColor: triviaOverlay.color}}>
+             <div className="absolute top-36 left-4 w-52 z-10 animate-in slide-in-from-left fade-in duration-500 pointer-events-none">
+                 <div className="bg-slate-900/90 backdrop-blur-xl border-l-4 rounded-r-xl shadow-2xl p-3 relative overflow-hidden flex flex-col gap-2" style={{borderColor: triviaOverlay.color}}>
                      
                      <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
-                             <div className="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-slate-900 shadow-sm" style={{backgroundColor: triviaOverlay.color}}>
+                             <div className="w-7 h-7 rounded-lg flex items-center justify-center font-bold text-slate-900 shadow-sm text-xs" style={{backgroundColor: triviaOverlay.color}}>
                                  {triviaOverlay.formula}
                              </div>
-                             <h4 className="text-sm font-bold text-white leading-tight">{triviaOverlay.name}</h4>
+                             <h4 className="text-xs font-bold text-white leading-tight truncate max-w-[100px]">{triviaOverlay.name}</h4>
                         </div>
-                        <span className="text-[9px] font-mono text-slate-500 uppercase">INFO</span>
+                        <span className="text-[8px] font-mono text-slate-500 uppercase tracking-wider">INFO</span>
                      </div>
                      
-                     <p className="text-xs text-slate-300 leading-relaxed font-medium pl-1 border-l border-white/10">
+                     <p className="text-[10px] text-slate-300 leading-relaxed font-medium pl-1 border-l border-white/10">
                          {triviaOverlay.text}
                      </p>
                  </div>
              </div>
           )}
 
-          {/* Center Screen Notifications */}
+          {/* Center Screen Notifications (Level Up / Achievements - positioned higher to avoid overlap) */}
           {(levelUpMessage || showRankUp) && (
-             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-center pointer-events-none z-30">
-                 {levelUpMessage && <h2 className="text-6xl font-black text-yellow-400 drop-shadow-[0_0_20px_rgba(250,204,21,0.6)] animate-bounce tracking-widest">{levelUpMessage}</h2>}
+             <div className="absolute top-[12%] left-1/2 -translate-x-1/2 text-center pointer-events-none z-30 w-full flex flex-col items-center gap-2">
+                 {levelUpMessage && (
+                     <div className="animate-in zoom-in slide-in-from-top duration-500">
+                         <div className="bg-gradient-to-r from-transparent via-yellow-500/20 to-transparent px-8 py-1 border-y border-yellow-500/50 backdrop-blur-sm">
+                             <h2 className="text-xl md:text-2xl font-black text-yellow-400 drop-shadow-[0_0_10px_rgba(250,204,21,0.5)] tracking-[0.3em] font-mono">{levelUpMessage}</h2>
+                         </div>
+                     </div>
+                 )}
                  {showRankUp && (
-                     <div className="mt-8 animate-pulse bg-black/50 backdrop-blur-sm p-6 rounded-3xl border border-white/10">
-                         <div className="text-2xl font-bold text-white mb-2">晋升!</div>
-                         <div className="text-5xl font-black" style={{color: currentRank.badgeColor}}>{currentRank.title}</div>
+                     <div className="animate-in zoom-in duration-500 mt-1">
+                         <div className="bg-black/60 backdrop-blur-md px-6 py-2 rounded-full border border-white/20 shadow-2xl flex flex-col items-center">
+                             <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-0.5">头衔晋升</div>
+                             <div className="text-lg font-black tracking-widest" style={{color: currentRank.badgeColor}}>{currentRank.title}</div>
+                         </div>
                      </div>
                  )}
              </div>
@@ -1475,7 +1784,7 @@ const GameEngine: React.FC<GameEngineProps> = ({
                     }
                     else {
                         p.currentSpeed = p.baseSpeed;
-                        isShootingRef.current = false;
+                        // isShootingRef removed, single click handled in handleShootingInput
                     }
                 }}
             />
